@@ -276,7 +276,6 @@ class DeviceCoordinator(DataUpdateCoordinator[DeviceResult]):
             slug=self._cfg.slug,
             display_name=self._cfg.display_name,
             device_type=self._cfg.atomic_class,
-            variant=self._cfg.variant,
             watt_threshold_on=TV_WATT_THRESHOLD_ON if is_tv else self._cfg.watt_threshold_on,
             watt_buckets=logic.parse_watt_buckets(list(self._cfg.watt_buckets)),
             sticky_hold_seconds=self._cfg.sticky_hold_seconds,
