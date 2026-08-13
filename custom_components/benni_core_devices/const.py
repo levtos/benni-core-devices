@@ -205,6 +205,11 @@ DEFAULT_STICKY_HOLD_SECONDS: Final[int] = 30
 DEFAULT_EXPOSE_SECONDARY_SENSORS: Final[bool] = False
 BOOT_INITIAL_PHASE_SECONDS: Final[int] = 30
 AVAILABILITY_FRESHNESS_SECONDS: Final[int] = 600
+# TV source arbitration: a conflicting WebOS-off/high-watt snapshot is
+# provisional for one source window. This remains scoped to the TV variant.
+TV_SOURCE_FRESHNESS_SECONDS: Final[int] = 20
+TV_SOURCE_CONFLICT_HOLD_SECONDS: Final[int] = 20
+TV_WATT_THRESHOLD_ON: Final[float] = 50.0
 
 
 class PowerState(str, Enum):

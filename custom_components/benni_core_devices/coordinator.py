@@ -42,6 +42,9 @@ from .const import (
     STORAGE_KEY_OVERRIDE_POWER_STATE,
     STORAGE_KEY_OVERRIDE_POWERED,
     STORAGE_VERSION,
+    TV_SOURCE_CONFLICT_HOLD_SECONDS,
+    TV_SOURCE_FRESHNESS_SECONDS,
+    TV_WATT_THRESHOLD_ON,
     UPDATE_INTERVAL_SECONDS,
     entry_profile,
     storage_key,
@@ -61,6 +64,7 @@ _LOGGER = logging.getLogger(__name__)
 
 STORAGE_KEY_LAST_STATE = "last_state"
 STORAGE_KEY_LAST_WATT_ACTIVE = "last_watt_active"
+STORAGE_KEY_SOURCE_CONFLICT_SINCE = "source_conflict_since"
 
 
 class DeviceCoordinator(DataUpdateCoordinator[DeviceResult]):
@@ -89,7 +93,7 @@ class DeviceCoordinator(DataUpdateCoordinator[DeviceResult]):
         )
         self._persisted = DevicePersisted(
             last_powered=None, last_powered_change=None, override=None, last_state=None,
-            last_watt_active=None,
+            last_watt_active=None, source_conflict_since=None,
         )
         self._unsub_listeners: list[CALLBACK_TYPE] = []
         self._boot_start: datetime = dt_util.now()
@@ -189,6 +193,7 @@ class DeviceCoordinator(DataUpdateCoordinator[DeviceResult]):
             override=override,
             last_state=self._persisted.last_state,
             last_watt_active=self._persisted.last_watt_active,
+            source_conflict_since=self._persisted.source_conflict_since,
         )
         await self._async_save()
         result = self._compute()
@@ -202,6 +207,7 @@ class DeviceCoordinator(DataUpdateCoordinator[DeviceResult]):
             override=None,
             last_state=self._persisted.last_state,
             last_watt_active=self._persisted.last_watt_active,
+            source_conflict_since=self._persisted.source_conflict_since,
         )
         await self._async_save()
         result = self._compute()
@@ -238,15 +244,17 @@ class DeviceCoordinator(DataUpdateCoordinator[DeviceResult]):
                 override=None,
                 last_state=self._persisted.last_state,
                 last_watt_active=self._persisted.last_watt_active,
+                source_conflict_since=self._persisted.source_conflict_since,
             )
         return result
 
     async def _persist_if_changed(self, result: DeviceResult) -> None:
         new_state = result.state if not result.fail_safe_active else self._persisted.last_state
         durable_changed = (
-            result.powered != self._persisted.last_powered
-            or result.last_powered_change != self._persisted.last_powered_change
-            or new_state != self._persisted.last_state
+        result.powered != self._persisted.last_powered
+        or result.last_powered_change != self._persisted.last_powered_change
+        or new_state != self._persisted.last_state
+        or result.source_conflict_since != self._persisted.source_conflict_since
         )
         # last_watt_active immer in-memory fortschreiben (das Halte-Fenster misst
         # ab letzter Aktivität), aber nur bei einer dauerhaften Änderung auf die
@@ -257,21 +265,30 @@ class DeviceCoordinator(DataUpdateCoordinator[DeviceResult]):
             override=self._persisted.override,
             last_state=new_state,
             last_watt_active=result.last_watt_active,
+            source_conflict_since=result.source_conflict_since,
         )
         if durable_changed:
             await self._async_save()
 
     def _build_logic_config(self) -> DeviceConfig:
+        is_tv = self._cfg.atomic_class == "media_device" and self._cfg.variant == "tv"
         return DeviceConfig(
             slug=self._cfg.slug,
             display_name=self._cfg.display_name,
             device_type=self._cfg.atomic_class,
-            watt_threshold_on=self._cfg.watt_threshold_on,
+            variant=self._cfg.variant,
+            watt_threshold_on=TV_WATT_THRESHOLD_ON if is_tv else self._cfg.watt_threshold_on,
             watt_buckets=logic.parse_watt_buckets(list(self._cfg.watt_buckets)),
             sticky_hold_seconds=self._cfg.sticky_hold_seconds,
             area_id=self._derive_area_id(),
             configured_slots=tuple(self.compute_entities.keys()),
             fail_safe=self._cfg.fail_safe,
+            source_freshness_seconds=(
+                TV_SOURCE_FRESHNESS_SECONDS if is_tv else None
+            ),
+            source_conflict_hold_seconds=(
+                TV_SOURCE_CONFLICT_HOLD_SECONDS if is_tv else 0
+            ),
         )
 
     def _derive_area_id(self) -> str | None:
@@ -433,7 +450,12 @@ class CombinedCoordinator(DataUpdateCoordinator):
                 continue
             value: Any = state.attributes.get(src.attribute) if src.attribute else state.state
             if value is None or (not src.attribute and value in (STATE_UNAVAILABLE, STATE_UNKNOWN, "")):
-                readings[src.key] = SourceReading(value=None, available=False)
+                readings[src.key] = SourceReading(
+                    value=None,
+                    available=False,
+                    attributes=dict(state.attributes),
+                    last_updated=state.last_updated,
+                )
                 continue
             numeric: float | None
             try:
@@ -443,6 +465,7 @@ class CombinedCoordinator(DataUpdateCoordinator):
             readings[src.key] = SourceReading(
                 value=value, numeric=numeric, available=True,
                 attributes=dict(state.attributes),
+                last_updated=state.last_updated,
             )
         return readings
 
@@ -603,6 +626,9 @@ def _persisted_to_dict(p: DevicePersisted) -> dict[str, Any]:
         STORAGE_KEY_LAST_WATT_ACTIVE: (
             p.last_watt_active.isoformat() if p.last_watt_active else None
         ),
+        STORAGE_KEY_SOURCE_CONFLICT_SINCE: (
+            p.source_conflict_since.isoformat() if p.source_conflict_since else None
+        ),
         STORAGE_KEY_OVERRIDE: None,
     }
     if p.override is not None:
@@ -631,6 +657,7 @@ def _persisted_from_dict(raw: dict[str, Any]) -> DevicePersisted:
         override=override,
         last_state=raw.get(STORAGE_KEY_LAST_STATE),
         last_watt_active=_parse_iso(raw.get(STORAGE_KEY_LAST_WATT_ACTIVE)),
+        source_conflict_since=_parse_iso(raw.get(STORAGE_KEY_SOURCE_CONFLICT_SINCE)),
     )
 
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.2 - TV Source Freshness for Media Arbitration
+
+- TV-Quellen erhalten ein eng begrenztes 20-s-Freshness-/Konfliktfenster für
+  WebOS-`off` bei frischer Leistung ab 50 W.
+- Ein TV-only-Kaltstart veröffentlicht bei fehlendem `assumed_state` zunächst
+  den expliziten, nicht-powernden Status `tv_candidate`; erst nach stabiler
+  Leistung wird daraus `watt_fallback`.
+- Der generische Combined-Master-Pfad liest dafür HA-`last_updated` und nutzt
+  den explizit konfigurierten `power_arbitration`-Node.
+- Frisches WebOS-`off` bleibt bei bereits bestätigtem Aus autoritativ; stale
+  WebOS-`on`/`playing` wird vor der Autoritätsentscheidung verworfen und darf
+  bei frischer Standby-Leistung keinen TV-Betrieb vortäuschen.
+- Andere Device-Varianten und Policy-/Apply-Verträge bleiben unverändert.
+- Referenzen: `benni-core-devices#41`, `benni_media_state#21`.
+
 ## 0.5.1 - Living Rollo Contract Hardening
 
 - Living Rollo Contract Hardening vorbereitet.

@@ -27,6 +27,8 @@ def _config(
     sticky: int = 30,
     buckets: tuple[L.WattBucket, ...] = (),
     configured: tuple[str, ...] = ("integration_entity",),
+    freshness: int | None = None,
+    conflict_hold: int = 0,
 ) -> L.DeviceConfig:
     return L.DeviceConfig(
         slug="x",
@@ -37,6 +39,8 @@ def _config(
         sticky_hold_seconds=sticky,
         area_id=None,
         configured_slots=configured,
+        source_freshness_seconds=freshness,
+        source_conflict_hold_seconds=conflict_hold,
     )
 
 
@@ -46,12 +50,14 @@ def _persisted(
     last_change: datetime | None = None,
     override: L.Override | None = None,
     last_watt_active: datetime | None = None,
+    source_conflict_since: datetime | None = None,
 ) -> L.DevicePersisted:
     return L.DevicePersisted(
         last_powered=last_powered,
         last_powered_change=last_change,
         override=override,
         last_watt_active=last_watt_active,
+        source_conflict_since=source_conflict_since,
     )
 
 
@@ -786,22 +792,35 @@ def test_watt_primary_default_off_keeps_integration_first():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _media_reading(value: str | None, *, assumed: bool = False) -> L.SlotReading:
+def _media_reading(
+    value: str | None, *, assumed: bool = False, updated: datetime = NOW
+) -> L.SlotReading:
     """Player-Reading wie ein media_device — integration_slot == state_slot."""
     return L.SlotReading(
         value=value,
         numeric=None,
         attributes={"assumed_state": True} if assumed else {},
-        last_updated=NOW if value is not None else None,
+        last_updated=updated if value is not None else None,
     )
 
 
-def _media_inputs(player: str | None, watt: float | None, *, assumed: bool):
+def _media_inputs(
+    player: str | None,
+    watt: float | None,
+    *,
+    assumed: bool,
+    updated: datetime = NOW,
+    watt_updated: datetime | None = None,
+):
     """media_device-Slots: primary_state (Player) == integration- & state-Slot,
     plus optionaler Watt-Meter."""
-    slots = {"player": _media_reading(player, assumed=assumed)}
+    slots = {"player": _media_reading(player, assumed=assumed, updated=updated)}
     slots["watt_sensor"] = (
-        _reading(str(watt), numeric=watt) if watt is not None else _reading(None)
+        L.SlotReading(
+            value=str(watt), numeric=watt, last_updated=watt_updated or updated
+        )
+        if watt is not None
+        else _reading(None)
     )
     return _inputs(
         slots,
@@ -912,3 +931,131 @@ def test_non_assumed_player_keeps_integration_first():
     assert r.power_source == C.PowerSource.INTEGRATION.value
     # Echter Konflikt (real-off + Strom) wird hier sehr wohl geflaggt.
     assert r.watt_disagrees is True
+
+
+def test_tv_fallback_under_fifty_watt_is_standby_off():
+    """TV-Watt-Fallback: 49 W bleiben unter der On-Schwelle."""
+    cfg = _config(threshold=50, configured=("player", "watt_sensor"), freshness=20)
+    inp = _media_inputs(None, 49.0, assumed=False)
+    inp = _inputs(
+        inp.slots,
+        integration_slot="player",
+        state_slot="player",
+        watt_slot="watt_sensor",
+    )
+    r = L.compute_device(cfg, inp, _persisted(), NOW)
+    assert r.powered is False
+    assert r.power_source == C.PowerSource.WATT_FALLBACK.value
+
+
+def test_tv_fallback_over_fifty_watt_is_active():
+    """TV-Watt-Fallback: frische 82 W aktivieren den TV."""
+    cfg = _config(threshold=50, configured=("player", "watt_sensor"), freshness=20)
+    inp = _media_inputs(None, 82.0, assumed=False)
+    inp = _inputs(
+        inp.slots,
+        integration_slot="player",
+        state_slot="player",
+        watt_slot="watt_sensor",
+    )
+    r = L.compute_device(cfg, inp, _persisted(), NOW)
+    assert r.powered is True
+    assert r.power_source == C.PowerSource.WATT_FALLBACK.value
+
+
+def test_tv_off_high_watt_missing_assumed_state_holds_previous_active():
+    """Kurzzeitiges WebOS-off bei 82/121 W darf keinen Off-Flap erzeugen."""
+    cfg = _config(
+        threshold=50,
+        configured=("player", "watt_sensor"),
+        freshness=20,
+        conflict_hold=20,
+    )
+    first = L.compute_device(
+        cfg,
+        _media_inputs("off", 82.0, assumed=False),
+        _persisted(last_powered=True),
+        NOW,
+    )
+    assert first.powered is True
+    assert first.source_conflict_since == NOW
+    assert first.watt_disagrees is True
+
+    second = L.compute_device(
+        cfg,
+        _media_inputs("off", 121.0, assumed=False, updated=NOW + timedelta(seconds=10)),
+        _persisted(
+            last_powered=True,
+            last_change=NOW - timedelta(seconds=60),
+            source_conflict_since=first.source_conflict_since,
+        ),
+        NOW + timedelta(seconds=10),
+    )
+    assert second.powered is True
+    assert second.watt_disagrees is True
+
+
+def test_tv_fresh_webos_off_wins_after_conflict_window():
+    """Ein anhaltend frisches WebOS-off wird nach dem Übergangsfenster off."""
+    cfg = _config(
+        threshold=50,
+        configured=("player", "watt_sensor"),
+        freshness=20,
+        conflict_hold=20,
+    )
+    now = NOW + timedelta(seconds=21)
+    r = L.compute_device(
+        cfg,
+        _media_inputs("off", 121.0, assumed=False, updated=now),
+        _persisted(
+            last_powered=True,
+            last_change=NOW - timedelta(seconds=60),
+            source_conflict_since=NOW,
+        ),
+        now,
+    )
+    assert r.powered is False
+    assert r.power_source == C.PowerSource.INTEGRATION.value
+
+
+def test_tv_stale_webos_off_allows_fresh_watt_fallback_after_window():
+    """Stale WebOS-off blockiert einen frischen Watt-Fallback nicht dauerhaft."""
+    cfg = _config(
+        threshold=50,
+        configured=("player", "watt_sensor"),
+        freshness=20,
+        conflict_hold=20,
+    )
+    now = NOW + timedelta(seconds=21)
+    r = L.compute_device(
+        cfg,
+        _media_inputs(
+            "off", 121.0, assumed=False, updated=NOW, watt_updated=now
+        ),
+        _persisted(source_conflict_since=NOW),
+        now,
+    )
+    assert r.powered is True
+    assert r.power_source == C.PowerSource.WATT_FALLBACK.value
+
+
+def test_tv_delayed_watt_does_not_override_fresh_webos_off():
+    """Ein verspäteter Wattwert darf einen frischen WebOS-off nicht überstimmen."""
+    cfg = _config(
+        threshold=50,
+        configured=("player", "watt_sensor"),
+        freshness=20,
+        conflict_hold=20,
+    )
+    now = NOW + timedelta(seconds=21)
+    r = L.compute_device(
+        cfg,
+        _media_inputs(
+            "off", 121.0, assumed=False, updated=now,
+            watt_updated=NOW,
+        ),
+        _persisted(last_powered=True, source_conflict_since=NOW),
+        now,
+    )
+    assert r.powered is False
+    assert r.power_source == C.PowerSource.INTEGRATION.value

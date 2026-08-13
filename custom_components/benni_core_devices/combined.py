@@ -1,14 +1,15 @@
-"""Combined-Atomic-Engine v0 (LH §6).
+"""Combined-Atomic-Engine v0/v1 (LH §6).
 
 Pure, HA-frei, in pytest testbar. Bildet einfache First-Match-Wins-/
 Truth-Table-Logiken über mehrere Quellen ab — z. B. Opening/Fenster-Logik.
 
-Bewusste v0-Grenzen: kein Timer, kein Latch, keine History. Nur:
+Bewusste v0-Grenzen: keine allgemeine Timer-/History-DSL. Nur:
 - mehrere Quellen mit Rolle + Entity
 - First-Match-Wins-Regelliste mit einfachen Bedingungen
 - Default-Regel + Reason
 - Output-Typen enum / code / boolean / number
 - einfache abgeleitete Binary-Sensoren (Gate-/Policy-Ausgaben)
+- explizit konfigurierte, kurze Power-Source-Arbitration für Device-Masters
 
 Der Coordinator liefert die `SourceReading`s (aus HA-States); diese Datei trifft
 nur reine Entscheidungen.
@@ -18,9 +19,18 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
-from .combined_expr import ExprError, as_bool, as_num, eval_expr, func_names, parse, refs
+from .combined_expr import (
+    ExprError,
+    as_bool,
+    as_num,
+    eval_expr,
+    func_names,
+    parse,
+    refs,
+)
 from .const import (
     COMBINED_OP_EQ,
     COMBINED_OP_GE,
@@ -50,8 +60,21 @@ NODE_ENUM = "enum"
 NODE_HEALTH = "health"
 NODE_LATCH = "latch"
 NODE_PREVIOUS = "previous"
-NODE_KINDS = (NODE_EXPR, NODE_GATE, NODE_ENUM, NODE_HEALTH, NODE_LATCH, NODE_PREVIOUS)
+NODE_POWER_ARBITRATION = "power_arbitration"
+NODE_KINDS = (
+    NODE_EXPR,
+    NODE_GATE,
+    NODE_ENUM,
+    NODE_HEALTH,
+    NODE_LATCH,
+    NODE_PREVIOUS,
+    NODE_POWER_ARBITRATION,
+)
 SELF_REF = "self"
+_NODE_VALUE = "__value__"
+_POWER_ACTIVE_OUTPUTS = frozenset({"webos", "watt_fallback", "conflict_hold"})
+_POWER_CANDIDATE_OUTPUT = "tv_candidate"
+_POWER_CANDIDATE_STATES = frozenset({"off", "standby"})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,6 +91,8 @@ class SourceReading:
     available: bool = True
     # Attribute der Quell-Entity (für health-Node: atomic_quality/degraded/…).
     attributes: dict[str, Any] = field(default_factory=dict)
+    # HA-State-Zeitpunkt; None bedeutet, dass Freshness nicht bewertbar ist.
+    last_updated: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -116,7 +141,11 @@ class DerivedCase:
 
 @dataclass(frozen=True)
 class DerivedValue:
-    """Benannter Zwischenwert (v1.0): expr | gate | enum | health | latch | previous."""
+    """Benannter Zwischenwert (v1.0): expr | gate | enum | health | latch | previous.
+
+    ``power_arbitration`` is deliberately configured rather than inferred from a
+    master slug: it owns a short-lived conflict rule for a device power source.
+    """
 
     name: str
     kind: str
@@ -126,6 +155,13 @@ class DerivedValue:
     set_expr: str | None = None      # latch
     reset_expr: str | None = None    # latch
     atomics: tuple[str, ...] = ()    # health: konsumierte source-keys
+    state_source: str | None = None
+    watt_source: str | None = None
+    assumed_state_source: str | None = None
+    active_states: tuple[str, ...] = ("on", "playing")
+    threshold: float | None = None
+    freshness_seconds: float | None = None
+    conflict_hold_seconds: float | None = None
     fail_safe: str | None = None     # off|open|hold_last|unknown (sonst config-Default)
     expose: bool = False             # als flaches Top-Level-Attribut veröffentlichen
 
@@ -290,6 +326,211 @@ def _failsafe_output(mode: str, prev: Any) -> Any:
     return None
 
 
+def _node_value(value: Any) -> Any:
+    """Return the scalar value of a node with optional persisted metadata."""
+    if isinstance(value, dict) and _NODE_VALUE in value:
+        return value[_NODE_VALUE]
+    return value
+
+
+def _as_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _fresh(reading: SourceReading | None, now: Any, seconds: float) -> bool:
+    """Return True only for an available reading with a comparable timestamp."""
+    if reading is None or not reading.available or reading.value is None:
+        return False
+    updated = _as_datetime(reading.last_updated)
+    current = _as_datetime(now)
+    if updated is None or current is None:
+        return False
+    if (updated.tzinfo is None) != (current.tzinfo is None):
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=current.tzinfo)
+        else:
+            current = current.replace(tzinfo=updated.tzinfo)
+    age = (current - updated).total_seconds()
+    return 0 <= age <= seconds
+
+
+def _power_state(
+    value: str,
+    conflict_since: datetime | None = None,
+    confirmed_state_updated: datetime | None = None,
+    candidate_since: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        _NODE_VALUE: value,
+        "conflict_since": conflict_since.isoformat() if conflict_since else None,
+        "confirmed_state_updated": (
+            confirmed_state_updated.isoformat()
+            if confirmed_state_updated else None
+        ),
+        "candidate_since": candidate_since.isoformat() if candidate_since else None,
+    }
+
+
+def _eval_power_arbitration(
+    dv: DerivedValue,
+    readings: dict[str, SourceReading],
+    prev_states: dict[str, Any],
+    now: Any,
+) -> dict[str, Any]:
+    """Apply a configured integration-first power source contract.
+
+    A fresh WebOS ``off`` remains authoritative unless it is the first half of a
+    TV-only cold start: fresh high watt plus missing ``assumed_state`` then emits
+    ``tv_candidate`` for the configured window. The candidate is explicit and
+    does not power the master; after the window it becomes ``watt_fallback``.
+    A confirmed active state still uses ``conflict_hold`` so a cold-start
+    ``on → off → on`` sequence cannot flap the master.
+    """
+    state = readings.get(dv.state_source or "")
+    watt = readings.get(dv.watt_source or "")
+    assumed = readings.get(dv.assumed_state_source or "")
+    threshold = 50.0 if dv.threshold is None else dv.threshold
+    freshness = 20.0 if dv.freshness_seconds is None else dv.freshness_seconds
+    hold_seconds = (
+        20.0 if dv.conflict_hold_seconds is None else dv.conflict_hold_seconds
+    )
+    current = _as_datetime(now)
+    watt_active = bool(
+        watt
+        and watt.numeric is not None
+        and watt.numeric >= threshold
+        and _fresh(watt, now, freshness)
+    )
+    state_fresh = _fresh(state, now, freshness)
+    state_updated = _as_datetime(state.last_updated if state else None)
+    state_value = (
+        str(state.value).strip().lower()
+        if state and state.available and state.value is not None
+        else None
+    )
+    if state_value in {"", "unknown", "unavailable"}:
+        state_value = None
+    active_states = {str(item).strip().lower() for item in dv.active_states}
+    assumed_value = as_bool(assumed.value) if assumed and assumed.available else None
+
+    # Freshness is checked before accepting WebOS on/playing. A stale active
+    # player must not keep a TV with fresh standby wattage alive.
+    if state_value in active_states and state_fresh:
+        return _power_state("webos")
+
+    previous_raw = prev_states.get(dv.name)
+    previous = _node_value(previous_raw)
+    previous_confirmed = _as_datetime(
+        previous_raw.get("confirmed_state_updated")
+        if isinstance(previous_raw, dict) else None
+    )
+    same_confirmed_state = (
+        previous in {"webos_off", "conflict_hold"}
+        and state_value is not None
+        and previous_confirmed is not None
+        and state_updated == previous_confirmed
+    )
+    previous_candidate_since = _as_datetime(
+        previous_raw.get("candidate_since")
+        if isinstance(previous_raw, dict) else None
+    )
+    previous_candidate_confirmed = (
+        previous == "watt_fallback" and previous_candidate_since is not None
+    )
+    if same_confirmed_state and previous == "webos_off":
+        return _power_state("webos_off", confirmed_state_updated=previous_confirmed)
+    if same_confirmed_state and previous == "conflict_hold" and current is not None:
+        previous_conflict_since = _as_datetime(
+            previous_raw.get("conflict_since")
+            if isinstance(previous_raw, dict) else None
+        )
+        if (
+            previous_conflict_since is not None
+            and (current - previous_conflict_since).total_seconds() > hold_seconds
+        ):
+            return _power_state("webos_off", confirmed_state_updated=previous_confirmed)
+
+    # Integration dropout: watt is a fallback only with fresh meter evidence.
+    if state_value is None and watt_active:
+        return _power_state(
+            "watt_fallback",
+            candidate_since=(
+                previous_candidate_since
+                if previous in {_POWER_CANDIDATE_OUTPUT, "watt_fallback"}
+                else None
+            ),
+        )
+
+    # A cold-start WebOS off/standby plus fresh high watt is provisional. It is
+    # intentionally separate from is_powered so the TV consumer can run its own
+    # 20-second media-context stabilization without inventing a durable power
+    # truth on the first contradictory tick.
+    candidate_conflict = (
+        state_value in _POWER_CANDIDATE_STATES
+        and watt_active
+        and assumed_value is None
+        and (state_fresh or state_updated is None)
+    )
+    if candidate_conflict:
+        if previous == _POWER_CANDIDATE_OUTPUT and current is not None:
+            candidate_since = previous_candidate_since or current
+            if (current - candidate_since).total_seconds() >= hold_seconds:
+                return _power_state(
+                    "watt_fallback", candidate_since=candidate_since
+                )
+            return _power_state(
+                _POWER_CANDIDATE_OUTPUT, candidate_since=candidate_since
+            )
+        if previous_candidate_confirmed:
+            return _power_state(
+                "watt_fallback", candidate_since=previous_candidate_since
+            )
+
+    # A non-active WebOS value that is older than the freshness window no
+    # longer outranks fresh meter evidence. This is still a fallback, never an
+    # override of a fresh WebOS ``off``.
+    if state_value is not None and not state_fresh and watt_active:
+        return _power_state("watt_fallback", candidate_since=previous_candidate_since)
+
+    # An explicit assumed_state=True is the existing, documented fallback path.
+    if assumed_value is True and watt_active:
+        return _power_state("watt_fallback")
+
+    # WebOS off/standby wins. Only a fresh high-watt conflict after a confirmed
+    # active state gets a short hold; it cannot create a new active state.
+    if (
+        state_value is not None
+        and watt_active
+        and state_fresh
+        and assumed_value is None
+    ):
+        if previous in _POWER_ACTIVE_OUTPUTS and current is not None:
+            raw_since = prev_states.get(dv.name)
+            conflict_since = _as_datetime(
+                raw_since.get("conflict_since") if isinstance(raw_since, dict) else None
+            )
+            if conflict_since is None:
+                conflict_since = current
+            if (current - conflict_since).total_seconds() <= hold_seconds:
+                return _power_state("conflict_hold", conflict_since, state_updated)
+
+        # No previous confirmed activity: publish only a provisional candidate.
+        if current is not None:
+            return _power_state(_POWER_CANDIDATE_OUTPUT, candidate_since=current)
+
+    return _power_state(
+        "webos_off",
+        confirmed_state_updated=state_updated if state_fresh else None,
+    )
+
+
 def _derived_names(config: CombinedConfig) -> set[str]:
     return {d.name for d in config.derived_values}
 
@@ -327,6 +568,13 @@ def _node_dep_refs(dv: DerivedValue) -> set[str]:
         except ExprError:
             pass
     out |= set(dv.atomics)
+    out |= {
+        source for source in (
+            dv.state_source,
+            dv.watt_source,
+            dv.assumed_state_source,
+        ) if source
+    }
     return out
 
 
@@ -361,10 +609,10 @@ def _ordered_derived(config: CombinedConfig) -> list[DerivedValue]:
 
 def _eval_node(
     dv: DerivedValue, env: dict[str, Any], readings: dict[str, SourceReading],
-    config: CombinedConfig, prev_states: dict[str, Any],
+    config: CombinedConfig, prev_states: dict[str, Any], now: Any,
 ) -> Any:
     fail_safe = dv.fail_safe or config.fail_safe
-    prev = prev_states.get(dv.name)
+    prev = _node_value(prev_states.get(dv.name))
     if dv.kind == NODE_EXPR:
         try:
             v = as_num(eval_expr(dv.expr or "", env))
@@ -421,6 +669,8 @@ def _eval_node(
         return _failsafe_value(NODE_LATCH, fail_safe, prev)
     if dv.kind == NODE_PREVIOUS:
         return env.get(SELF_REF)
+    if dv.kind == NODE_POWER_ARBITRATION:
+        return _eval_power_arbitration(dv, readings, prev_states, now)
     return None
 
 
@@ -488,10 +738,11 @@ def evaluate_combined(
     derived_out: dict[str, Any] = {}
     node_states: dict[str, Any] = {}
     for dv in _ordered_derived(config):
-        val = _eval_node(dv, env, readings, config, prev_nodes)
+        raw_val = _eval_node(dv, env, readings, config, prev_nodes, now)
+        val = _node_value(raw_val)
         env[dv.name] = val
         derived_out[dv.name] = val
-        node_states[dv.name] = val
+        node_states[dv.name] = raw_val
 
     # ── Regeln (v0) — referenzieren Quellen, derived oder ${self} ───────────
     matched: int | None = None
@@ -584,6 +835,18 @@ def validate_combined_v1(config: CombinedConfig) -> list[str]:
             for a in dv.atomics:
                 if a not in source_keys:
                     errors.append(f"{dv.name}: health-Quelle {a!r} ist keine Source")
+        elif dv.kind == NODE_POWER_ARBITRATION:
+            for label, source in (
+                ("state_source", dv.state_source),
+                ("watt_source", dv.watt_source),
+                ("assumed_state_source", dv.assumed_state_source),
+            ):
+                if source and source not in source_keys:
+                    errors.append(f"{dv.name}: {label} {source!r} ist keine Source")
+            if not dv.state_source or not dv.watt_source:
+                errors.append(
+                    f"{dv.name}: power_arbitration braucht state_source und watt_source"
+                )
 
     for name in config.exposed_attributes:
         if name not in names:
@@ -669,6 +932,15 @@ def parse_combined(slug: str, raw: Any) -> CombinedConfig | None:
     """
     if not isinstance(raw, dict):
         return None
+
+    def optional_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     output_type = raw.get("output_type", OUTPUT_TYPE_ENUM)
     if output_type not in (
         OUTPUT_TYPE_ENUM,
@@ -777,8 +1049,27 @@ def parse_combined(slug: str, raw: Any) -> CombinedConfig | None:
                 cases=tuple(cases),
                 default=item.get("default"),
                 set_expr=(str(item["set"]) if item.get("set") is not None else None),
-                reset_expr=(str(item["reset"]) if item.get("reset") is not None else None),
+                reset_expr=(
+                    str(item["reset"]) if item.get("reset") is not None else None
+                ),
                 atomics=tuple(str(a) for a in atomics if a),
+                state_source=(
+                    str(item["state_source"]) if item.get("state_source") else None
+                ),
+                watt_source=(
+                    str(item["watt_source"]) if item.get("watt_source") else None
+                ),
+                assumed_state_source=(
+                    str(item["assumed_state_source"])
+                    if item.get("assumed_state_source") else None
+                ),
+                active_states=tuple(
+                    str(state)
+                    for state in (item.get("active_states") or ("on", "playing"))
+                ),
+                threshold=optional_float(item.get("threshold")),
+                freshness_seconds=optional_float(item.get("freshness_seconds")),
+                conflict_hold_seconds=optional_float(item.get("conflict_hold_seconds")),
                 fail_safe=(str(item["fail_safe"]) if item.get("fail_safe") else None),
                 expose=bool(item.get("expose")),
             )
