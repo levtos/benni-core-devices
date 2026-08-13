@@ -65,6 +65,12 @@ class DeviceConfig:
     configured_slots: tuple[str, ...] = ()
     # Fail-Safe-Modus für passthrough/numeric (greift nur wenn keine Quelle frisch).
     fail_safe: str = FAIL_SAFE_HOLD_LAST
+    # Optionales, variantenspezifisches Freshness-Fenster für Power-Quellen.
+    # None bewahrt die bestehende value-presence Semantik anderer Devices.
+    source_freshness_seconds: int | None = None
+    # Kurzes Konfliktfenster für TV: WebOS off + frischer Wattwert ist zunächst
+    # ein Übergang, nicht sofort ein bestätigtes Aus.
+    source_conflict_hold_seconds: int = 0
 
 
 @dataclass(frozen=True)
@@ -125,6 +131,8 @@ class DevicePersisted:
     # Halte-Fenster (sticky_hold_seconds) misst ab hier, um kurze Null-Watt-
     # Phasen mitten im Zyklus zu überbrücken.
     last_watt_active: datetime | None = None
+    # Beginn eines nicht-assumed WebOS-off/high-watt-Quellenkonflikts.
+    source_conflict_since: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +166,8 @@ class DeviceResult:
     # watt_primary: fortgeschriebener „zuletzt aktiv"-Zeitstempel fürs Halte-
     # Fenster. Der Coordinator persistiert ihn zurück in DevicePersisted.
     last_watt_active: datetime | None = None
+    # Fortschreibung des TV-Quellenkonflikts für den nächsten Tick.
+    source_conflict_since: datetime | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,6 +248,15 @@ def _is_fresh(reading: SlotReading | None, now: datetime, max_age: int) -> bool:
     return (now - reading.last_updated).total_seconds() <= max_age
 
 
+def _source_is_fresh(
+    reading: SlotReading | None, now: datetime, max_age: int | None
+) -> bool:
+    """Apply a time window only to devices that explicitly opt into it."""
+    if max_age is None:
+        return _has_value(reading)
+    return _is_fresh(reading, now, max_age)
+
+
 def classify_power_state(
     watt: float | None, buckets: tuple[WattBucket, ...]
 ) -> str:
@@ -307,12 +326,18 @@ def compute_device(
     watt_reading = inputs.slots.get(inputs.watt_slot) if inputs.watt_slot else None
 
     watt = watt_reading.numeric if watt_reading is not None else None
-    # v2-Optimierung: Integration gilt als "frisch", sobald sie einen gültigen
-    # Wert hat (echte Ausfälle = None). Kein 600s-Zeitfenster mehr — sonst
-    # erscheint ein stabiler on/off-Switch oder ein "off"-Media fälschlich stale.
-    integration_fresh = _has_value(integration_reading)
+    # v2-Optimierung bleibt für alle nicht explizit konfigurierten Devices
+    # erhalten. TV erhält dagegen ein begrenztes Quellenfenster, damit ein alter
+    # WebOS-off-Wert nicht dauerhaft einen frischen Watt-Fallback blockiert.
+    integration_fresh = _source_is_fresh(
+        integration_reading, now, config.source_freshness_seconds
+    )
     integration_bool = _as_bool(integration_reading.value) if integration_reading else None
-    watt_fresh = watt_reading is not None and watt is not None
+    watt_fresh = (
+        watt_reading is not None
+        and watt is not None
+        and _source_is_fresh(watt_reading, now, config.source_freshness_seconds)
+    )
 
     # ── FLEET-83: assumed-state-Quelle erkennen → automatisch watt-primär.
     # ``assumed_state`` steht in den HA-Attributen der Integrations-/State-Quelle
@@ -349,6 +374,7 @@ def compute_device(
             raw_state=state_reading.value if state_reading else None,
             extra=state_reading.attributes if state_reading else {},
             last_watt_active=persisted.last_watt_active,
+            source_conflict_since=persisted.source_conflict_since,
         )
 
     # ── R-DC-01: Fallback-Hierarchie für `powered`
@@ -357,7 +383,40 @@ def compute_device(
     last_watt_active = persisted.last_watt_active
     watt_on = watt_fresh and watt is not None and watt >= config.watt_threshold_on
 
-    if effective_watt_primary and watt_fresh:
+    # Issue #21: if WebOS briefly reports off while a fresh TV watt sample is
+    # clearly above the on threshold, do not create an active→off→active edge.
+    # The conflict is provisional for a bounded window. During that window a
+    # previously active TV is held; a device without a previous active state is
+    # kept off, so this rule cannot invent activation. After the window the
+    # normal hierarchy applies: fresh WebOS-off still wins, while stale WebOS
+    # can fall through to the fresh watt fallback.
+    source_conflict = (
+        config.source_conflict_hold_seconds > 0
+        and not assumed_source
+        and integration_fresh
+        and integration_bool is False
+        and watt_on
+    )
+    source_conflict_since = persisted.source_conflict_since
+    source_conflict_age: float | None = None
+    if source_conflict:
+        if source_conflict_since is None:
+            source_conflict_since = now
+        source_conflict_age = (now - source_conflict_since).total_seconds()
+    else:
+        source_conflict_since = None
+    in_source_conflict_hold = (
+        source_conflict
+        and source_conflict_age is not None
+        and source_conflict_age < config.source_conflict_hold_seconds
+    )
+
+    if in_source_conflict_hold:
+        powered = persisted.last_powered is True
+        source = PowerSource.INTEGRATION
+        if watt_on:
+            last_watt_active = now
+    elif effective_watt_primary and watt_fresh:
         # Watt-primär: die reale Leistung entscheidet. Der Plug-Schalter sagt
         # nur, dass Strom anliegt — nicht, dass das Gerät läuft.
         if watt_on:
@@ -413,7 +472,7 @@ def compute_device(
             watt_disagrees = True
     elif source is PowerSource.INTEGRATION and watt_fresh and watt is not None:
         # Integration sagt off, aber Watt über Threshold? → flagge
-        if powered is False and watt >= config.watt_threshold_on:
+        if (powered is False or source_conflict) and watt >= config.watt_threshold_on:
             watt_disagrees = True
 
     # ── last_powered_change ableiten
@@ -447,6 +506,7 @@ def compute_device(
         raw_state=state_reading.value if state_reading else None,
         extra=state_reading.attributes if state_reading else {},
         last_watt_active=last_watt_active,
+        source_conflict_since=source_conflict_since if source_conflict else None,
     )
 
 
