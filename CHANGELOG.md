@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.3 - Fix coordinator setup contract
+
+- Behebt den Setup-Fehler, bei dem der HA-Coordinator das V2-Feld `variant`
+  fälschlich an die reine `logic.DeviceConfig` weiterreichte.
+- `variant` bleibt Teil von `DeviceConfigV2`; die reine Compute-Konfiguration
+  erhält weiterhin nur ihr eigenes Vertragsmodell.
+- Regressionstest deckt den tatsächlichen Coordinator-/DeviceConfig-Aufruf ab.
+- Die TV-Arbitration aus Issue #21 bleibt unverändert erhalten.
+
 ## 0.5.2 - TV Source Freshness for Media Arbitration
 
 - TV-Quellen erhalten ein eng begrenztes 20-s-Freshness-/Konfliktfenster für
