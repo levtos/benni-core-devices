@@ -73,6 +73,8 @@ NODE_KINDS = (
 SELF_REF = "self"
 _NODE_VALUE = "__value__"
 _POWER_ACTIVE_OUTPUTS = frozenset({"webos", "watt_fallback", "conflict_hold"})
+_POWER_CANDIDATE_OUTPUT = "tv_candidate"
+_POWER_CANDIDATE_STATES = frozenset({"off", "standby"})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -363,6 +365,7 @@ def _power_state(
     value: str,
     conflict_since: datetime | None = None,
     confirmed_state_updated: datetime | None = None,
+    candidate_since: datetime | None = None,
 ) -> dict[str, Any]:
     return {
         _NODE_VALUE: value,
@@ -371,6 +374,7 @@ def _power_state(
             confirmed_state_updated.isoformat()
             if confirmed_state_updated else None
         ),
+        "candidate_since": candidate_since.isoformat() if candidate_since else None,
     }
 
 
@@ -382,11 +386,12 @@ def _eval_power_arbitration(
 ) -> dict[str, Any]:
     """Apply a configured integration-first power source contract.
 
-    A fresh WebOS ``off`` remains authoritative. The only exception is a fresh
-    high watt reading while the assumed-state attribute is unavailable: after a
-    confirmed active state, that conflict is held for the configured window so
-    a cold-start ``on → off → on`` sequence cannot flap the master. A cold boot
-    never activates from this conflict alone.
+    A fresh WebOS ``off`` remains authoritative unless it is the first half of a
+    TV-only cold start: fresh high watt plus missing ``assumed_state`` then emits
+    ``tv_candidate`` for the configured window. The candidate is explicit and
+    does not power the master; after the window it becomes ``watt_fallback``.
+    A confirmed active state still uses ``conflict_hold`` so a cold-start
+    ``on → off → on`` sequence cannot flap the master.
     """
     state = readings.get(dv.state_source or "")
     watt = readings.get(dv.watt_source or "")
@@ -415,7 +420,9 @@ def _eval_power_arbitration(
     active_states = {str(item).strip().lower() for item in dv.active_states}
     assumed_value = as_bool(assumed.value) if assumed and assumed.available else None
 
-    if state_value in active_states:
+    # Freshness is checked before accepting WebOS on/playing. A stale active
+    # player must not keep a TV with fresh standby wattage alive.
+    if state_value in active_states and state_fresh:
         return _power_state("webos")
 
     previous_raw = prev_states.get(dv.name)
@@ -429,6 +436,13 @@ def _eval_power_arbitration(
         and state_value is not None
         and previous_confirmed is not None
         and state_updated == previous_confirmed
+    )
+    previous_candidate_since = _as_datetime(
+        previous_raw.get("candidate_since")
+        if isinstance(previous_raw, dict) else None
+    )
+    previous_candidate_confirmed = (
+        previous == "watt_fallback" and previous_candidate_since is not None
     )
     if same_confirmed_state and previous == "webos_off":
         return _power_state("webos_off", confirmed_state_updated=previous_confirmed)
@@ -445,13 +459,45 @@ def _eval_power_arbitration(
 
     # Integration dropout: watt is a fallback only with fresh meter evidence.
     if state_value is None and watt_active:
-        return _power_state("watt_fallback")
+        return _power_state(
+            "watt_fallback",
+            candidate_since=(
+                previous_candidate_since
+                if previous in {_POWER_CANDIDATE_OUTPUT, "watt_fallback"}
+                else None
+            ),
+        )
+
+    # A cold-start WebOS off/standby plus fresh high watt is provisional. It is
+    # intentionally separate from is_powered so the TV consumer can run its own
+    # 20-second media-context stabilization without inventing a durable power
+    # truth on the first contradictory tick.
+    candidate_conflict = (
+        state_value in _POWER_CANDIDATE_STATES
+        and watt_active
+        and assumed_value is None
+        and (state_fresh or state_updated is None)
+    )
+    if candidate_conflict:
+        if previous == _POWER_CANDIDATE_OUTPUT and current is not None:
+            candidate_since = previous_candidate_since or current
+            if (current - candidate_since).total_seconds() >= hold_seconds:
+                return _power_state(
+                    "watt_fallback", candidate_since=candidate_since
+                )
+            return _power_state(
+                _POWER_CANDIDATE_OUTPUT, candidate_since=candidate_since
+            )
+        if previous_candidate_confirmed:
+            return _power_state(
+                "watt_fallback", candidate_since=previous_candidate_since
+            )
 
     # A non-active WebOS value that is older than the freshness window no
     # longer outranks fresh meter evidence. This is still a fallback, never an
     # override of a fresh WebOS ``off``.
     if state_value is not None and not state_fresh and watt_active:
-        return _power_state("watt_fallback")
+        return _power_state("watt_fallback", candidate_since=previous_candidate_since)
 
     # An explicit assumed_state=True is the existing, documented fallback path.
     if assumed_value is True and watt_active:
@@ -474,6 +520,10 @@ def _eval_power_arbitration(
                 conflict_since = current
             if (current - conflict_since).total_seconds() <= hold_seconds:
                 return _power_state("conflict_hold", conflict_since, state_updated)
+
+        # No previous confirmed activity: publish only a provisional candidate.
+        if current is not None:
+            return _power_state(_POWER_CANDIDATE_OUTPUT, candidate_since=current)
 
     return _power_state(
         "webos_off",

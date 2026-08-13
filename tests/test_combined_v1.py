@@ -252,6 +252,19 @@ def _tv_power_config():
                 ),
                 "expose": True,
             },
+            {
+                "name": "tv_candidate",
+                "kind": "gate",
+                "expr": '${tv_power_source} == "tv_candidate"',
+                "expose": True,
+            },
+            {
+                "name": "media_context",
+                "kind": "enum",
+                "cases": [{"when": "${is_powered}", "output": "tv"}],
+                "default": "idle",
+                "expose": True,
+            },
         ],
         "default_output": "${tv_power_source}",
     }
@@ -300,14 +313,51 @@ def test_tv_power_arbitration_unknown_player_uses_fresh_watt_fallback_over_fifty
     assert result.derived["is_powered"] is True
 
 
-def test_tv_power_arbitration_cold_start_off_high_watt_missing_assumed_is_off():
+def test_tv_power_arbitration_cold_start_off_high_watt_is_only_a_candidate():
     now = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
     result = CB.evaluate_combined(
         _tv_power_config(),
         _tv_readings("off", 121, None, now),
         now=now,
     )
+    assert result.derived["tv_power_source"] == "tv_candidate"
+    assert result.derived["tv_candidate"] is True
+    assert result.derived["is_powered"] is False
+    assert result.derived["media_context"] == "idle"
+
+    persisted = CB.CombinedPersisted(last_state=result.state, node_states=result.node_states)
+    after_window = now + timedelta(seconds=20)
+    confirmed = CB.evaluate_combined(
+        _tv_power_config(),
+        _tv_readings("off", 121, None, after_window),
+        persisted=persisted,
+        now=after_window,
+    )
+    assert confirmed.derived["tv_power_source"] == "watt_fallback"
+    assert confirmed.derived["tv_candidate"] is False
+    assert confirmed.derived["is_powered"] is True
+    assert confirmed.derived["media_context"] == "tv"
+
+
+def test_tv_power_arbitration_candidate_is_discarded_below_fifty_watt():
+    now = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
+    candidate = CB.evaluate_combined(
+        _tv_power_config(),
+        _tv_readings("off", 121, None, now),
+        now=now,
+    )
+    persisted = CB.CombinedPersisted(
+        last_state=candidate.state,
+        node_states=candidate.node_states,
+    )
+    result = CB.evaluate_combined(
+        _tv_power_config(),
+        _tv_readings("off", 33, None, now + timedelta(seconds=1)),
+        persisted=persisted,
+        now=now + timedelta(seconds=1),
+    )
     assert result.derived["tv_power_source"] == "webos_off"
+    assert result.derived["tv_candidate"] is False
     assert result.derived["is_powered"] is False
 
 
@@ -394,6 +444,19 @@ def test_tv_power_arbitration_stale_webos_off_allows_fresh_watt_fallback():
     )
     assert result.derived["tv_power_source"] == "watt_fallback"
     assert result.derived["is_powered"] is True
+
+
+def test_tv_power_arbitration_stale_webos_active_with_fresh_standby_watt_is_off():
+    now = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
+    stale_webos = now - timedelta(seconds=21)
+    for state in ("on", "playing"):
+        result = CB.evaluate_combined(
+            _tv_power_config(),
+            _tv_readings(state, 0, None, stale_webos, watt_stamp=now),
+            now=now,
+        )
+        assert result.derived["tv_power_source"] == "webos_off"
+        assert result.derived["is_powered"] is False
 
 
 # ── Validierung (Dry-Run) ────────────────────────────────────────────────────
