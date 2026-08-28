@@ -638,9 +638,13 @@ def _eval_node(
         return _failsafe_value(NODE_ENUM, fail_safe, prev)
     if dv.kind == NODE_HEALTH:
         worst = "ok"
+        source_by_key = {source.key: source for source in config.sources}
         for key in dv.atomics:
             r = readings.get(key)
             if r is None or not r.available or r.value is None:
+                source = source_by_key.get(key)
+                if source is not None and not source.required:
+                    continue
                 worst = "problem"
                 break
             q = str(r.attributes.get("atomic_quality") or "ok")

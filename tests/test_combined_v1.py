@@ -166,6 +166,54 @@ def test_health_node():
     assert prob.state == "problem"
 
 
+def test_health_node_skips_unavailable_optional_source():
+    cfg = _cfg(
+        output_type="enum",
+        sources=(
+            CB.CombinedSource(key="control", role="control", entity="switch.optional", required=False),
+            _src("watt"),
+        ),
+        derived_values=(
+            CB.DerivedValue(name="h", kind="health", atomics=("control", "watt")),
+        ),
+        default_output="${h}",
+    )
+
+    result = CB.evaluate_combined(
+        cfg,
+        {
+            "control": _r(None, available=False),
+            "watt": _r("75", 75.0),
+        },
+    )
+
+    assert result.state == "ok"
+    assert result.degraded is False
+    assert result.degraded_reason == []
+
+
+def test_health_node_keeps_unavailable_required_source_problematic():
+    cfg = _cfg(
+        output_type="enum",
+        sources=(_src("control"), _src("watt")),
+        derived_values=(
+            CB.DerivedValue(name="h", kind="health", atomics=("control", "watt")),
+        ),
+        default_output="${h}",
+    )
+
+    result = CB.evaluate_combined(
+        cfg,
+        {
+            "control": _r(None, available=False),
+            "watt": _r("75", 75.0),
+        },
+    )
+
+    assert result.state == "problem"
+    assert result.degraded is True
+
+
 # ── latch (Schmitt-Hysterese + hold + boot fail_safe) ────────────────────────
 
 
