@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.4 - Optional control paths do not override watt truth
+
+- Generic `health` nodes ignore unavailable sources configured with
+  `required: false`; unavailable required sources remain fail-safe problems.
+- Adds regression coverage for a watt-owned PC Master whose disabled control
+  path cannot override active/off watt evidence.
+- Keeps headline state and `is_active` consistent for decisive watt readings,
+  while missing watt evidence remains `unknown`.
+
 ## 0.5.3 - Fix coordinator setup contract
 
 - Behebt den Setup-Fehler, bei dem der HA-Coordinator das V2-Feld `variant`
