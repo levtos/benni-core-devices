@@ -386,6 +386,8 @@ def _eval_power_arbitration(
 ) -> dict[str, Any]:
     """Apply a configured integration-first power source contract.
 
+    An available WebOS ``on``/``playing`` remains authoritative because HA
+    states are event-based and do not need periodic refreshes while unchanged.
     A fresh WebOS ``off`` remains authoritative unless it is the first half of a
     TV-only cold start: fresh high watt plus missing ``assumed_state`` then emits
     ``tv_candidate`` for the configured window. The candidate is explicit and
@@ -420,9 +422,11 @@ def _eval_power_arbitration(
     active_states = {str(item).strip().lower() for item in dv.active_states}
     assumed_value = as_bool(assumed.value) if assumed and assumed.available else None
 
-    # Freshness is checked before accepting WebOS on/playing. A stale active
-    # player must not keep a TV with fresh standby wattage alive.
-    if state_value in active_states and state_fresh:
+    # HA state entities are event-based: an unchanged, available on/playing
+    # value is not stale merely because no new event arrived within the watt
+    # freshness window. Unknown/unavailable was normalized to None above and
+    # continues through the conservative watt fallback.
+    if state_value in active_states:
         return _power_state("webos")
 
     previous_raw = prev_states.get(dv.name)

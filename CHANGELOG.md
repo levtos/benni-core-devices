@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.5 - Keep event-based WebOS activity authoritative
+
+- Fixes Issue #50: an available, unchanged WebOS `on`/`playing` state no
+  longer expires after the watt freshness window. Home Assistant state entities
+  are event-based; silence while the value is unchanged is not stale evidence.
+- Prevents normal short TV power dips below 50 W from publishing a false
+  `webos_off`, while unknown/unavailable WebOS and the existing 50 W fallback,
+  candidate, conflict-hold, and shutdown contracts remain unchanged.
+
 ## 0.5.4 - Optional control paths do not override watt truth
 
 - Generic `health` nodes ignore unavailable sources configured with
