@@ -494,17 +494,28 @@ def test_tv_power_arbitration_stale_webos_off_allows_fresh_watt_fallback():
     assert result.derived["is_powered"] is True
 
 
-def test_tv_power_arbitration_stale_webos_active_with_fresh_standby_watt_is_off():
+def test_tv_power_arbitration_unchanged_webos_active_survives_low_watt_dip():
     now = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
     stale_webos = now - timedelta(seconds=21)
     for state in ("on", "playing"):
         result = CB.evaluate_combined(
             _tv_power_config(),
-            _tv_readings(state, 0, None, stale_webos, watt_stamp=now),
+            _tv_readings(state, 46, True, stale_webos, watt_stamp=now),
             now=now,
         )
-        assert result.derived["tv_power_source"] == "webos_off"
-        assert result.derived["is_powered"] is False
+        assert result.derived["tv_power_source"] == "webos"
+        assert result.derived["is_powered"] is True
+
+
+def test_tv_power_arbitration_unavailable_webos_below_fifty_watt_is_off():
+    now = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
+    result = CB.evaluate_combined(
+        _tv_power_config(),
+        _tv_readings(None, 46, None, now),
+        now=now,
+    )
+    assert result.derived["tv_power_source"] == "webos_off"
+    assert result.derived["is_powered"] is False
 
 
 # ── Validierung (Dry-Run) ────────────────────────────────────────────────────
