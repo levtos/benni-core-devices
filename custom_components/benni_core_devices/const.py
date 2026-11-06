@@ -16,6 +16,7 @@ STORAGE_VERSION: Final[int] = 1
 
 # hass.data flags / entry buckets
 DATA_COORDINATORS: Final = "coordinators"
+DATA_HUB_DEVICE_ID: Final = "hub_device_id"
 DATA_COMBINEDS: Final = "combined_coordinators"
 DATA_MASTERS: Final = "master_coordinators"
 DATA_WS_REGISTERED: Final = "_ws_registered"
