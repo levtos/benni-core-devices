@@ -31,6 +31,7 @@ from .const import (
     CONF_DISPLAY_NAME,
     CONF_GROUP_MEMBERS,
     CONF_LIGHT_GROUPS,
+    DATA_HUB_DEVICE_ID,
     DOMAIN,
     POWER_STATE_SLUGS,
     combined_object_id_prefix,
@@ -56,16 +57,23 @@ def _object_id(profile: str, slug: str, suffix: str | None = None) -> str:
 
 
 def _device_info(coordinator: DeviceCoordinator) -> DeviceInfo:
-    """Ein HA-Device pro Gerät, eingehängt unter dem Hub-Gerät (via_device),
-    sodass alle Geräte unter 'Benni Core · Devices' gruppiert erscheinen."""
-    from . import HUB_IDENTIFIER
+    """Link the device to the hub registered for this config entry."""
+    hub_link: dict[str, Any]
+    if "via_device_id" in DeviceInfo.__annotations__:
+        entry_data = coordinator.hass.data[DOMAIN][coordinator.entry.entry_id]
+        hub_link = {"via_device_id": entry_data[DATA_HUB_DEVICE_ID]}
+    else:
+        # Older supported Home Assistant releases only accept the identifier.
+        from . import HUB_IDENTIFIER
+
+        hub_link = {"via_device": HUB_IDENTIFIER}
 
     return DeviceInfo(
         identifiers={(DOMAIN, f"device:{coordinator.slug}")},
         name=coordinator.display_name,
         manufacturer="Benni Core · Devices",
         model=coordinator.model,
-        via_device=HUB_IDENTIFIER,
+        **hub_link,
     )
 
 

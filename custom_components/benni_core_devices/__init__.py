@@ -18,6 +18,7 @@ from .const import (
     CONF_MASTERS,
     DATA_COMBINEDS,
     DATA_COORDINATORS,
+    DATA_HUB_DEVICE_ID,
     DATA_MASTERS,
     DATA_WS_REGISTERED,
     DOMAIN,
@@ -97,7 +98,7 @@ def _reconcile_devices(
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     profile = entry_profile(entry)
     dev_reg = dr.async_get(hass)
-    dev_reg.async_get_or_create(
+    hub_device = dev_reg.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={HUB_IDENTIFIER},
         name=f"{NAME} ({profile})",
@@ -163,6 +164,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = hass.data.setdefault(DOMAIN, {})
     data[entry.entry_id] = {
         DATA_COORDINATORS: coordinators,
+        DATA_HUB_DEVICE_ID: hub_device.id,
         DATA_COMBINEDS: combineds,
         DATA_MASTERS: masters,
     }
